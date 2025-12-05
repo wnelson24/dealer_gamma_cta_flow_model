@@ -1,10 +1,11 @@
 """
-USDJPY Dealer-Gamma + CTA Positioning Reflexivity Model
+USDJPY Dealer-Gamma + CTA Positioning Reflexivity Model (RDP Version)
 Author: William Nelson
 Purpose: Provide a flow-aware prediction of vol-surface moves around macro events.
 
 Requirements:
-- Refinitiv Eikon (Eikon Data API)
+- Refinitiv Workspace (RDP API)
+- refinitiv-dataplatform
 - numpy, pandas, scipy, scikit-learn
 """
 
@@ -12,27 +13,30 @@ Requirements:
 # 0. IMPORTS
 ###############################################################
 
-import eikon as ek
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from sklearn.linear_model import LogisticRegression
 
-
-###############################################################
-# 1. EIKON CONNECTION
-###############################################################
-
-# >>> INSERT YOUR EIKON APP KEY HERE <<<
-ek.set_app_key("YOUR_APP_KEY_HERE")
+from refinitiv.dataplatform import Sessions, Delivery
 
 
 ###############################################################
-# 2. BLACK-SCHOLES GREEKS
+# 1. RDP AUTHENTICATION
+###############################################################
+
+# Workspace AppKey (OAuth)
+Sessions.get_session(
+    session_type=Sessions.SessionTypeEnum.DESKTOP,
+    app_key="YOUR_RDP_APP_KEY"
+).open()
+
+
+###############################################################
+# 2. BLACK–SCHOLES GAMMA
 ###############################################################
 
 def bs_gamma(S, K, T, vol, r=0.0):
-    """Black–Scholes Gamma for FX options."""
     if K <= 0 or vol <= 0 or T <= 0:
         return 0.0
 
@@ -42,22 +46,18 @@ def bs_gamma(S, K, T, vol, r=0.0):
 
 
 ###############################################################
-# 3. VOL SURFACE FETCHER (USDJPY)
+# 3. VOL SURFACE FETCHER (RDP VERSION)
 ###############################################################
 
 def fetch_usdjpy_vol_surface():
     """
-    Fetch ATM, RR, BF vols for USDJPY from Eikon.
+    Fetch ATM, RR, BF vols for USDJPY from RDP.
     Tenors: 1W, 1M, 3M.
     """
 
-    fields = [
-        "TR.ATMVol", 
-        "TR.RiskReversal",
-        "TR.Butterfly"
-    ]
+    fields = ["TR.ATMVol", "TR.RiskReversal", "TR.Butterfly"]
 
-    tenors = {
+    rics = {
         "1W":  "JPY1WK=",
         "1M":  "JPY1MO=",
         "3M":  "JPY3MO="
@@ -65,103 +65,85 @@ def fetch_usdjpy_vol_surface():
 
     surface = {}
 
-    for tenor, ric in tenors.items():
-        df, err = ek.get_data(ric, fields)
-        if err:
-            raise ValueError(f"Eikon error for {ric}: {err}")
-        
+    for tenor, ric in rics.items():
+        df = Delivery.get_data(universe=[ric], fields=fields).data.df
+
         surface[tenor] = {
-            "ATM": float(df["ATM Volatility"][0])/100,
-            "RR":  float(df["Risk Reversal"][0])/100,
-            "BF":  float(df["Butterfly"][0])/100
+            "ATM": float(df["TR.ATMVol"].iloc[0]) / 100.0,
+            "RR":  float(df["TR.RiskReversal"].iloc[0]) / 100.0,
+            "BF":  float(df["TR.Butterfly"].iloc[0]) / 100.0
         }
 
     # Spot
-    spot_df, err = ek.get_data("USDJPY=", ["TRDPRC_1"])
-    spot = float(spot_df["TRDPRC_1"][0])
+    spot_df = Delivery.get_snapshot(universe=["USDJPY="]).data.df
+    spot = float(spot_df["MID_PRICE"].iloc[0])
 
     return surface, spot
 
 
 ###############################################################
-# 4. CME OPTION-CHAIN PULL (6J)
+# 4. CME OPTION-CHAIN FETCH (RDP VERSION)
 ###############################################################
 
 def fetch_6j_option_chain():
-    """
-    Fetch CME JPY/USD FX options (6J).
-    Note: 6J options are on JPY per USD, inverse of USDJPY.
-    We'll flip strikes accordingly.
-    """
     chain = "0#6J+O"
-    fields = ["TR.StrikePrice", "TR.PutCall", "TR.ExchangeOpenInterest"]
 
-    df, err = ek.get_data(chain, fields)
-    if err:
-        raise ValueError(f"Eikon option chain error: {err}")
+    fields = [
+        "TR.StrikePrice",
+        "TR.PutCall",
+        "TR.ExchangeOpenInterest"
+    ]
 
+    df = Delivery.get_data(universe=[chain], fields=fields).data.df
     df = df.dropna()
+
     return df
 
 
 ###############################################################
-# 5. DEALER GAMMA + FLIP CALCULATION
+# 5. DEALER GAMMA & GAMMA FLIP
 ###############################################################
 
 def estimate_dealer_gamma_usdjpy(spot, vol_1m, option_chain):
-    """
-    Approximate dealer gamma exposure using CME 6J options.
-    Convert 6J strikes (JPY per USD) to USDJPY strike levels.
-    """
-
     gammas = []
 
     for _, row in option_chain.iterrows():
-        K_6J = row["Strike Price"]
-        if K_6J <= 0:
-            continue
+        K = row["TR.StrikePrice"]  # JPY per USD, same as USDJPY
 
-        # CME 6J options are quoted as JPY per USD => USDJPY strike = K_6J
-        K = K_6J
-
-        T = 30/365
+        T = 30 / 365
         vol = vol_1m
 
         gamma = bs_gamma(spot, K, T, vol)
-        exposure = gamma * row["Exchange Open Interest"]
-        gammas.append(exposure)
+        oi = row["TR.ExchangeOpenInterest"]
 
-    total_gamma = np.sum(gammas)
-    return total_gamma
+        gammas.append(gamma * oi)
+
+    return np.sum(gammas)
 
 
 def find_gamma_flip_level(spot, vol_1m, option_chain, iterations=40):
-    """
-    Solve for the spot where net gamma exposure = 0.
-    Simple binary search.
-    """
 
     def g(S):
         return estimate_dealer_gamma_usdjpy(S, vol_1m, option_chain)
 
     lo, hi = spot * 0.9, spot * 1.1
+
     for _ in range(iterations):
         mid = 0.5 * (lo + hi)
         if g(mid) > 0:
             lo = mid
         else:
             hi = mid
+
     return 0.5 * (lo + hi)
 
 
 ###############################################################
-# 6. CTA POSITIONING MODEL
+# 6. CTA INPUTS & SIGNAL
 ###############################################################
 
 def fetch_cta_inputs_usdjpy():
-    """
-    Fetch momentum & realized vol proxies for CTA model.
-    """
+
     fields = [
         "TR.Momentum20D",
         "TR.Momentum60D",
@@ -169,45 +151,36 @@ def fetch_cta_inputs_usdjpy():
         "TR.RealizedVol"
     ]
 
-    df, err = ek.get_data("USDJPY=", fields)
-    if err:
-        raise ValueError(f"Eikon CTA fetch error: {err}")
+    df = Delivery.get_data(
+        universe=["USDJPY="],
+        fields=fields
+    ).data.df
 
-    data = df.iloc[0].astype(float)
-    return data
+    return df.iloc[0].astype(float)
 
 
-def compute_cta_signal(momentum20, momentum60, momentum120, realized_vol, target_vol=0.10):
-    """
-    Simple weighted trend + vol-target leverage model.
-    """
+def compute_cta_signal(m20, m60, m120, realized_vol, target_vol=0.10):
+
     trend = (
-        0.4*momentum20 +
-        0.3*momentum60 +
-        0.3*momentum120
+        0.4 * m20 +
+        0.3 * m60 +
+        0.3 * m120
     )
 
-    # Vol-targeting leverage (inverse of realized vol)
     leverage = target_vol / realized_vol if realized_vol > 0 else 1.0
 
     return trend * leverage
 
 
 ###############################################################
-# 7. EVENT SHOCK MODEL (SCAFFOLD)
+# 7. EVENT SHOCK MODEL (PLACEHOLDER)
 ###############################################################
 
 def dummy_event_model(dealer_gamma, cta_signal, rr_skew):
-    """
-    Placeholder logistic model showing how you would integrate
-    dealer gamma + CTA + skew into predicted vol-surface reaction.
-    Replace with a real trained model later.
-    """
 
-    # Toy “probability” formulas:
     atm_pop_prob = 1 / (1 + np.exp(-(0.7*cta_signal - 0.4*dealer_gamma + rr_skew)))
     rr_steep_prob = 1 / (1 + np.exp(-(0.5*cta_signal + 0.3*rr_skew)))
-    gamma_squeeze = abs(dealer_gamma) / (abs(dealer_gamma) + 5_000)  # bounded 0–1
+    gamma_squeeze = abs(dealer_gamma) / (abs(dealer_gamma) + 5000)
 
     return {
         "atm_pop_prob": float(atm_pop_prob),
@@ -221,45 +194,32 @@ def dummy_event_model(dealer_gamma, cta_signal, rr_skew):
 ###############################################################
 
 def run_reflexivity_model():
-    print("\n--- USDJPY REFLEXIVITY MODEL ---\n")
+    print("\n--- USDJPY REFLEXIVITY MODEL (RDP VERSION) ---\n")
 
-    # -----------------------------
-    # 1. Vol Surface + Spot
-    # -----------------------------
+    # 1. Vol Surface
     surface, spot = fetch_usdjpy_vol_surface()
     vol_1m = surface["1M"]["ATM"]
     skew_1m = surface["1M"]["RR"]
 
-    # -----------------------------
     # 2. Option Chain
-    # -----------------------------
     chain = fetch_6j_option_chain()
 
-    # -----------------------------
-    # 3. Dealer Gamma & Flip
-    # -----------------------------
+    # 3. Dealer gamma and flip
     dealer_gamma = estimate_dealer_gamma_usdjpy(spot, vol_1m, chain)
     flip = find_gamma_flip_level(spot, vol_1m, chain)
 
-    # -----------------------------
     # 4. CTA Positioning
-    # -----------------------------
-    cta_data = fetch_cta_inputs_usdjpy()
+    cta = fetch_cta_inputs_usdjpy()
     cta_sig = compute_cta_signal(
-        cta_data["Momentum 20 Day"],
-        cta_data["Momentum 60 Day"],
-        cta_data["Momentum 120 Day"],
-        cta_data["Realized Volatility"]
+        cta["TR.Momentum20D"],
+        cta["TR.Momentum60D"],
+        cta["TR.Momentum120D"],
+        cta["TR.RealizedVol"]
     )
 
-    # -----------------------------
-    # 5. Event Shock Model
-    # -----------------------------
+    # 5. Event Shock
     shock = dummy_event_model(dealer_gamma, cta_sig, skew_1m)
 
-    # -----------------------------
-    # 6. Pretty Output
-    # -----------------------------
     print(f"Spot: {spot:.2f}")
     print(f"1M ATM Vol: {vol_1m:.2%}")
     print(f"1M RR Skew: {skew_1m:.2%}\n")
